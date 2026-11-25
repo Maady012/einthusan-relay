@@ -58,11 +58,12 @@ function fetchUrl(targetUrl, options = {}) {
 
 function decryptEJ(encryptedData) {
   try {
-    const sliced = encryptedData.slice(0, 10) + encryptedData.slice(-1) + encryptedData.slice(12, -1);
+    const len = encryptedData.length;
+    const sliced = encryptedData.slice(0, 10) + encryptedData[len - 1] + encryptedData.slice(12, len - 1);
     const decoded = Buffer.from(sliced, 'base64').toString('utf-8');
     return JSON.parse(decoded);
   } catch (e) {
-    return null;
+    return { error: e.message };
   }
 }
 
@@ -82,24 +83,14 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ status: 'ok', service: 'einthusan-relay' }));
   }
 
-  // Robust stream resolver with PingOutcome fallback
-  if (parsed.pathname === '/resolve') {
-    const title = parsed.query.title;
+  if (parsed.pathname === '/debug') {
+    const title = parsed.query.title || 'Leo';
     const lang = parsed.query.lang || 'tamil';
-    if (!title) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'Missing title' }));
-    }
-
     try {
       const searchUrl = `https://${EINTHUSAN_HOST}/movie/results/?lang=${encodeURIComponent(lang)}&query=${encodeURIComponent(title)}`;
       const searchRes = await fetchUrl(searchUrl);
-      
       const watchMatch = searchRes.body.match(/href=["'](\/movie\/watch\/([^"'/]+)\/[^"']*)["']/i);
-      if (!watchMatch) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'Movie not found on Einthusan' }));
-      }
+      if (!watchMatch) return res.end(JSON.stringify({ error: 'not found' }));
 
       const watchPath = watchMatch[1];
       const videoId = watchMatch[2];
@@ -108,67 +99,94 @@ const server = http.createServer(async (req, res) => {
 
       const pageIdMatch = watchRes.body.match(/data-pageid=["']([^"']+)["']/i);
       const pingablesMatch = watchRes.body.match(/data-ejpingables=["']([^"']+)["']/i);
-      const hlsMatch = watchRes.body.match(/data-hls-link=["']([^"']+)["']/i);
-      const mp4Match = watchRes.body.match(/data-mp4-link=["']([^"']+)["']/i);
 
-      let directStream = (hlsMatch ? hlsMatch[1] : (mp4Match ? mp4Match[1] : null));
-      let ejStream = null;
-
+      let ajaxDebug = null;
+      let decrypted = null;
       if (pageIdMatch && pingablesMatch) {
+        const ajaxUrl = `https://${EINTHUSAN_HOST}/ajax/movie/watch/${videoId}/`;
+        const postBody = new URLSearchParams({
+          'xEvent': 'UIVideoPlayer.PingOutcome',
+          'xJson': JSON.stringify({
+            'EJOutcomes': pingablesMatch[1],
+            'NativeHLS': false
+          }),
+          'arcVersion': '3',
+          'appVersion': '59',
+          'gorilla.csrf.Token': pageIdMatch[1]
+        }).toString();
+
+        const ajaxRes = await fetchUrl(ajaxUrl, {
+          method: 'POST',
+          body: postBody,
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': watchUrl
+          }
+        });
+        ajaxDebug = ajaxRes.body;
         try {
-          const ajaxUrl = `https://${EINTHUSAN_HOST}/ajax/movie/watch/${videoId}/`;
-          const postBody = new URLSearchParams({
-            'xEvent': 'UIVideoPlayer.PingOutcome',
-            'xJson': JSON.stringify({
-              'EJOutcomes': pingablesMatch[1],
-              'NativeHLS': false
-            }),
-            'arcVersion': '3',
-            'appVersion': '59',
-            'gorilla.csrf.Token': pageIdMatch[1]
-          }).toString();
-
-          const ajaxRes = await fetchUrl(ajaxUrl, {
-            method: 'POST',
-            body: postBody,
-            headers: {
-              'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-              'X-Requested-With': 'XMLHttpRequest',
-              'Referer': watchUrl
-            }
-          });
-
           const json = JSON.parse(ajaxRes.body);
           if (json && json.Data && json.Data.EJLinks) {
-            const dec = decryptEJ(json.Data.EJLinks);
-            if (dec) {
-              ejStream = dec.HLSLink || dec.MP4Link;
-            }
+            decrypted = decryptEJ(json.Data.EJLinks);
           }
-        } catch (ajaxErr) {
-          console.error('AJAX PingOutcome error:', ajaxErr.message);
+        } catch (e) {
+          decrypted = { jsonError: e.message };
         }
       }
 
-      const finalStream = ejStream || (directStream ? directStream.replace(/&amp;/g, '&') : null);
-
-      if (finalStream) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({
-          title: title,
-          lang: lang,
-          watchUrl: watchUrl,
-          streamUrl: finalStream,
-          isHLS: finalStream.includes('.m3u8')
-        }));
-      }
-
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'Stream extraction failed' }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({
+        videoId,
+        hasPageId: Boolean(pageIdMatch),
+        hasPingables: Boolean(pingablesMatch),
+        ajaxRaw: ajaxDebug,
+        decrypted: decrypted
+      }));
     } catch (e) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: e.message }));
     }
+  }
+
+  // Stream proxy with pipe
+  if (parsed.pathname === '/proxy') {
+    const target = parsed.query.url;
+    if (!target) {
+      res.writeHead(400);
+      return res.end('Missing url');
+    }
+
+    try {
+      const targetUrl = new URL(target);
+      const isHttps = targetUrl.protocol === 'https:';
+      const client = isHttps ? https : http;
+
+      const proxyReq = client.request(targetUrl, {
+        method: 'GET',
+        headers: {
+          'User-Agent': HEADERS['User-Agent'],
+          'Referer': `https://${EINTHUSAN_HOST}/`,
+          'Range': req.headers['range'] || 'bytes=0-'
+        },
+        rejectUnauthorized: false
+      }, (proxyRes) => {
+        const headers = { ...proxyRes.headers };
+        headers['access-control-allow-origin'] = '*';
+        res.writeHead(proxyRes.statusCode, headers);
+        proxyRes.pipe(res);
+      });
+
+      proxyReq.on('error', err => {
+        if (!res.headersSent) res.writeHead(502);
+        res.end(err.message);
+      });
+      req.pipe(proxyReq);
+    } catch (e) {
+      res.writeHead(500);
+      res.end(e.message);
+    }
+    return;
   }
 
   res.writeHead(404);
@@ -176,5 +194,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Relay active on port ${PORT}`);
+  console.log(`Relay debug running on port ${PORT}`);
 });
