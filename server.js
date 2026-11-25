@@ -13,12 +13,21 @@ const HEADERS = {
   'Accept-Encoding': 'gzip, deflate'
 };
 
-function fetchUrl(targetUrl, headers = HEADERS) {
+function fetchUrl(targetUrl, options = {}) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(targetUrl);
+    const method = options.method || 'GET';
+    const postData = options.body || null;
+    const reqHeaders = { ...HEADERS, Host: parsed.hostname, ...(options.headers || {}) };
+
+    if (postData) {
+      reqHeaders['Content-Length'] = Buffer.byteLength(postData);
+    }
+
     const req = https.request(parsed, {
-      method: 'GET',
-      headers: { ...headers, Host: parsed.hostname }
+      method: method,
+      headers: reqHeaders,
+      rejectUnauthorized: false
     }, (res) => {
       let chunks = [];
       res.on('data', chunk => chunks.push(chunk));
@@ -27,23 +36,34 @@ function fetchUrl(targetUrl, headers = HEADERS) {
         const encoding = res.headers['content-encoding'];
         if (encoding === 'gzip') {
           zlib.gunzip(buffer, (err, decoded) => {
-            if (err) resolve(buffer.toString('utf-8'));
-            else resolve(decoded.toString('utf-8'));
+            if (err) resolve({ body: buffer.toString('utf-8'), headers: res.headers, status: res.statusCode });
+            else resolve({ body: decoded.toString('utf-8'), headers: res.headers, status: res.statusCode });
           });
         } else if (encoding === 'deflate') {
           zlib.inflate(buffer, (err, decoded) => {
-            if (err) resolve(buffer.toString('utf-8'));
-            else resolve(decoded.toString('utf-8'));
+            if (err) resolve({ body: buffer.toString('utf-8'), headers: res.headers, status: res.statusCode });
+            else resolve({ body: decoded.toString('utf-8'), headers: res.headers, status: res.statusCode });
           });
         } else {
-          resolve(buffer.toString('utf-8'));
+          resolve({ body: buffer.toString('utf-8'), headers: res.headers, status: res.statusCode });
         }
       });
     });
     req.on('error', reject);
     req.setTimeout(8000, () => { req.destroy(new Error('Timeout')); });
+    if (postData) req.write(postData);
     req.end();
   });
+}
+
+function decryptEJ(encryptedData) {
+  try {
+    const sliced = encryptedData.slice(0, 10) + encryptedData.slice(-1) + encryptedData.slice(12, -1);
+    const decoded = Buffer.from(sliced, 'base64').toString('utf-8');
+    return JSON.parse(decoded);
+  } catch (e) {
+    return null;
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -62,107 +82,93 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ status: 'ok', service: 'einthusan-relay' }));
   }
 
+  // Robust stream resolver with PingOutcome fallback
   if (parsed.pathname === '/resolve') {
     const title = parsed.query.title;
     const lang = parsed.query.lang || 'tamil';
     if (!title) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'Missing title query parameter' }));
+      return res.end(JSON.stringify({ error: 'Missing title' }));
     }
 
     try {
       const searchUrl = `https://${EINTHUSAN_HOST}/movie/results/?lang=${encodeURIComponent(lang)}&query=${encodeURIComponent(title)}`;
-      const searchHtml = await fetchUrl(searchUrl);
+      const searchRes = await fetchUrl(searchUrl);
       
-      const watchMatch = searchHtml.match(/href=["'](\/movie\/watch\/[^"']+)["']/i);
+      const watchMatch = searchRes.body.match(/href=["'](\/movie\/watch\/([^"'/]+)\/[^"']*)["']/i);
       if (!watchMatch) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'Movie not found on Einthusan' }));
       }
 
       const watchPath = watchMatch[1];
+      const videoId = watchMatch[2];
       const watchUrl = `https://${EINTHUSAN_HOST}${watchPath}`;
-      const watchHtml = await fetchUrl(watchUrl, { ...HEADERS, Referer: searchUrl });
+      const watchRes = await fetchUrl(watchUrl, { headers: { Referer: searchUrl } });
 
-      const hlsMatch = watchHtml.match(/data-hls-link=["']([^"']+)["']/i);
-      const mp4Match = watchHtml.match(/data-mp4-link=["']([^"']+)["']/i);
-      let rawStream = (hlsMatch ? hlsMatch[1] : (mp4Match ? mp4Match[1] : null));
+      const pageIdMatch = watchRes.body.match(/data-pageid=["']([^"']+)["']/i);
+      const pingablesMatch = watchRes.body.match(/data-ejpingables=["']([^"']+)["']/i);
+      const hlsMatch = watchRes.body.match(/data-hls-link=["']([^"']+)["']/i);
+      const mp4Match = watchRes.body.match(/data-mp4-link=["']([^"']+)["']/i);
 
-      if (rawStream) {
-        rawStream = rawStream.replace(/&amp;/g, '&');
-        // Check if CDN host is an IP, rewrite to cdn1.einthusan.io for SSL handshake
-        const streamObj = new URL(rawStream);
-        const fixedUrl = `https://cdn1.einthusan.io${streamObj.pathname}${streamObj.search}`;
+      let directStream = (hlsMatch ? hlsMatch[1] : (mp4Match ? mp4Match[1] : null));
+      let ejStream = null;
 
+      if (pageIdMatch && pingablesMatch) {
+        try {
+          const ajaxUrl = `https://${EINTHUSAN_HOST}/ajax/movie/watch/${videoId}/`;
+          const postBody = new URLSearchParams({
+            'xEvent': 'UIVideoPlayer.PingOutcome',
+            'xJson': JSON.stringify({
+              'EJOutcomes': pingablesMatch[1],
+              'NativeHLS': false
+            }),
+            'arcVersion': '3',
+            'appVersion': '59',
+            'gorilla.csrf.Token': pageIdMatch[1]
+          }).toString();
+
+          const ajaxRes = await fetchUrl(ajaxUrl, {
+            method: 'POST',
+            body: postBody,
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+              'X-Requested-With': 'XMLHttpRequest',
+              'Referer': watchUrl
+            }
+          });
+
+          const json = JSON.parse(ajaxRes.body);
+          if (json && json.Data && json.Data.EJLinks) {
+            const dec = decryptEJ(json.Data.EJLinks);
+            if (dec) {
+              ejStream = dec.HLSLink || dec.MP4Link;
+            }
+          }
+        } catch (ajaxErr) {
+          console.error('AJAX PingOutcome error:', ajaxErr.message);
+        }
+      }
+
+      const finalStream = ejStream || (directStream ? directStream.replace(/&amp;/g, '&') : null);
+
+      if (finalStream) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
           title: title,
           lang: lang,
           watchUrl: watchUrl,
-          streamUrl: rawStream,
-          cdnDomainUrl: fixedUrl,
-          isHLS: Boolean(hlsMatch)
+          streamUrl: finalStream,
+          isHLS: finalStream.includes('.m3u8')
         }));
-      } else {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'Player data links not found in HTML' }));
       }
+
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Stream extraction failed' }));
     } catch (e) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: e.message }));
     }
-  }
-
-  // Streaming Proxy endpoint
-  if (parsed.pathname === '/proxy') {
-    const target = parsed.query.url;
-    if (!target) {
-      res.writeHead(400);
-      return res.end('Missing url param');
-    }
-
-    try {
-      const targetUrl = new URL(target);
-      const isHttps = targetUrl.protocol === 'https:';
-      const client = isHttps ? https : http;
-
-      // Extract path and query
-      const options = {
-        hostname: targetUrl.hostname,
-        port: targetUrl.port || (isHttps ? 443 : 80),
-        path: targetUrl.pathname + targetUrl.search,
-        method: 'GET',
-        headers: {
-          'User-Agent': HEADERS['User-Agent'],
-          'Referer': `https://${EINTHUSAN_HOST}/`,
-          'Range': req.headers['range'] || 'bytes=0-'
-        },
-        rejectUnauthorized: false,
-        checkServerIdentity: () => undefined // Disable hostname mismatch errors on raw CDN IPs
-      };
-
-      const proxyReq = client.request(options, (proxyRes) => {
-        // Forward status and headers
-        const headers = { ...proxyRes.headers };
-        headers['access-control-allow-origin'] = '*';
-        res.writeHead(proxyRes.statusCode, headers);
-        proxyRes.pipe(res);
-      });
-
-      proxyReq.on('error', err => {
-        console.error('Proxy Error:', err.message);
-        if (!res.headersSent) {
-          res.writeHead(502, { 'Content-Type': 'text/plain' });
-        }
-        res.end(`Proxy stream failed: ${err.message}`);
-      });
-
-      req.pipe(proxyReq);
-    } catch (e) {
-      res.writeHead(500);
-      res.end(e.message);
-    }
-    return;
   }
 
   res.writeHead(404);
@@ -170,5 +176,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Einthusan relay running on port ${PORT}`);
+  console.log(`Relay active on port ${PORT}`);
 });
