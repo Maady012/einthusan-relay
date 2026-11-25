@@ -157,7 +157,7 @@ const server = http.createServer(async (req, res) => {
 
   // Resolver endpoint that handles full movie stream resolution
   if (parsed.pathname === '/resolve-stream') {
-    const moviePath = parsed.query.path; // e.g. /movie/watch/6tv3/?lang=tamil
+    const moviePath = parsed.query.path;
     if (!moviePath) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: 'Missing path param' }));
@@ -170,14 +170,12 @@ const server = http.createServer(async (req, res) => {
         headers: { 'Cookie': sessionCookies }
       });
 
-      // Extract data-pageid
       const mPageId = watchPage.body.match(/data-pageid=["']([^"']+)["']/);
       if (!mPageId) {
         throw new Error('Watch page did not return data-pageid');
       }
       let pageId = mPageId[1].replace(/&#43;/g, '+').replace(/&amp;/g, '&');
 
-      // Extract ejpingables
       const mPing = watchPage.body.match(/data-ejpingables=["']([^"']+)["']/);
       let pingables = mPing ? mPing[1] : null;
 
@@ -193,7 +191,6 @@ const server = http.createServer(async (req, res) => {
       const encryptedOutcomes = encryptEJ(pingUrls);
       const tabId = pageId + Math.floor(1000 * Math.random());
 
-      // Send PingOutcome to Einthusan
       const ajaxWatchUrl = `https://${EINTHUSAN_HOST}/ajax${moviePath}`;
       const outcomePayload = querystring.stringify({
         xEvent: 'UIVideoPlayer.PingOutcome',
@@ -215,9 +212,6 @@ const server = http.createServer(async (req, res) => {
         body: outcomePayload
       });
 
-      console.log('[Stream] PingOutcome response:', outcomeResp.status, outcomeResp.body);
-
-      // Check if outcomeResp gave EJLinks
       let streamData = null;
       try {
         const parsedResp = JSON.parse(outcomeResp.body);
@@ -230,7 +224,6 @@ const server = http.createServer(async (req, res) => {
         console.error('Failed to parse outcome body:', err);
       }
 
-      // Check fallback from watchPage HTML attributes if PingOutcome didn't return direct links
       let rawHls = null;
       let rawMp4 = null;
       const mHls = watchPage.body.match(/data-hls-link=["']([^"']+)["']/);
@@ -249,6 +242,39 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: e.message, stack: e.stack }));
+    }
+  }
+
+  // Rewrite HLS manifest so segments go through /proxy
+  if (parsed.pathname === '/proxy-hls') {
+    const targetUrl = parsed.query.url;
+    if (!targetUrl) {
+      res.writeHead(400);
+      return res.end('Missing url param');
+    }
+    try {
+      const parsedHls = new URL(targetUrl);
+      const basePath = parsedHls.origin + parsedHls.pathname.substring(0, parsedHls.pathname.lastIndexOf('/') + 1);
+      
+      const hlsRes = await fetchWithCookies(targetUrl);
+      const lines = hlsRes.body.split('\n');
+      const rewrittenLines = lines.map(line => {
+        const trimmed = line.trim();
+        if (trimmed && !trimmed.startsWith('#')) {
+          const absoluteChunk = trimmed.startsWith('http') ? trimmed : (basePath + trimmed);
+          return `/proxy?url=${encodeURIComponent(absoluteChunk)}`;
+        }
+        return line;
+      });
+
+      res.writeHead(200, {
+        'Content-Type': 'application/vnd.apple.mpegurl',
+        'Access-Control-Allow-Origin': '*'
+      });
+      return res.end(rewrittenLines.join('\n'));
+    } catch (e) {
+      res.writeHead(500);
+      return res.end(e.message);
     }
   }
 
@@ -305,7 +331,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ status: 'einthusan-relay-live', version: '2.1.0' }));
+  res.end(JSON.stringify({ status: 'einthusan-relay-live', version: '2.2.0' }));
 });
 
 server.listen(PORT, () => {
