@@ -81,17 +81,14 @@ async function getAuthenticatedSession() {
   }
 
   console.log('[Auth] Initiating login handshake with Einthusan...');
-  // 1. GET /login/ to grab cookies and data-pageid
   const loginGet = await fetchWithCookies(`https://${EINTHUSAN_HOST}/login/`);
   const initialCookies = parseCookieHeader(loginGet.cookies);
 
-  // Extract data-pageid
   const match = loginGet.body.match(/data-pageid=["']([^"']+)["']/);
   if (!match) {
     throw new Error('Could not find data-pageid on /login/ page');
   }
 
-  // HTML entity decode
   let pageId = match[1]
     .replace(/&#43;/g, '+')
     .replace(/&amp;/g, '&')
@@ -124,14 +121,27 @@ async function getAuthenticatedSession() {
 
   console.log('[Auth] Login response status:', loginPost.status, 'body:', loginPost.body);
 
-  // Merge cookies
   const postCookies = parseCookieHeader(loginPost.cookies);
   const combinedCookies = [initialCookies, postCookies].filter(Boolean).join('; ');
 
   cachedSessionCookies = combinedCookies;
   cachedSessionTime = now;
 
-  return { cookies: combinedCookies, response: loginPost.body, status: loginPost.status };
+  return combinedCookies;
+}
+
+function decryptEJ(e) {
+  const s = e.slice(0, 10) + e.slice(e.length - 1) + e.slice(12, e.length - 1);
+  return JSON.parse(Buffer.from(s, 'base64').toString('utf-8'));
+}
+
+function encryptEJ(obj) {
+  const str = JSON.stringify(obj);
+  const b = Buffer.from(str, 'utf-8').toString('base64');
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let rand2 = '';
+  for (let i = 0; i < 2; i++) rand2 += chars.charAt(Math.floor(Math.random() * chars.length));
+  return b.slice(0, 10) + rand2 + b.slice(11) + b.slice(10, 11);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -145,14 +155,100 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  if (parsed.pathname === '/login-test') {
+  // Resolver endpoint that handles full movie stream resolution
+  if (parsed.pathname === '/resolve-stream') {
+    const moviePath = parsed.query.path; // e.g. /movie/watch/6tv3/?lang=tamil
+    if (!moviePath) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Missing path param' }));
+    }
+
     try {
-      const authResult = await getAuthenticatedSession();
+      const sessionCookies = await getAuthenticatedSession();
+      const movieUrl = `https://${EINTHUSAN_HOST}${moviePath}`;
+      const watchPage = await fetchWithCookies(movieUrl, {
+        headers: { 'Cookie': sessionCookies }
+      });
+
+      // Extract data-pageid
+      const mPageId = watchPage.body.match(/data-pageid=["']([^"']+)["']/);
+      if (!mPageId) {
+        throw new Error('Watch page did not return data-pageid');
+      }
+      let pageId = mPageId[1].replace(/&#43;/g, '+').replace(/&amp;/g, '&');
+
+      // Extract ejpingables
+      const mPing = watchPage.body.match(/data-ejpingables=["']([^"']+)["']/);
+      let pingables = mPing ? mPing[1] : null;
+
+      let pingUrls = ['https://cdn1.einthusan.io/ping.m4v', 'https://cdn2.einthusan.io/ping.m4v', 'https://cdn4.einthusan.io/ping.m4v'];
+      if (pingables) {
+        try {
+          pingUrls = decryptEJ(pingables);
+        } catch (e) {
+          console.error('Error decrypting pingables:', e);
+        }
+      }
+
+      const encryptedOutcomes = encryptEJ(pingUrls);
+      const tabId = pageId + Math.floor(1000 * Math.random());
+
+      // Send PingOutcome to Einthusan
+      const ajaxWatchUrl = `https://${EINTHUSAN_HOST}/ajax${moviePath}`;
+      const outcomePayload = querystring.stringify({
+        xEvent: 'UIVideoPlayer.PingOutcome',
+        xJson: JSON.stringify({ EJOutcomes: encryptedOutcomes, NativeHLS: true }),
+        arcVersion: '12',
+        appVersion: '365',
+        tabID: tabId,
+        'gorilla.csrf.Token': pageId
+      });
+
+      const outcomeResp = await fetchWithCookies(ajaxWatchUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'Cookie': sessionCookies,
+          'Referer': movieUrl,
+          'X-Requested-With': 'XMLHttpRequest'
+        },
+        body: outcomePayload
+      });
+
+      console.log('[Stream] PingOutcome response:', outcomeResp.status, outcomeResp.body);
+
+      // Check if outcomeResp gave EJLinks
+      let streamData = null;
+      try {
+        const parsedResp = JSON.parse(outcomeResp.body);
+        if (parsedResp.Data && parsedResp.Data.EJLinks) {
+          streamData = decryptEJ(parsedResp.Data.EJLinks);
+        } else if (parsedResp.Data) {
+          streamData = parsedResp.Data;
+        }
+      } catch (err) {
+        console.error('Failed to parse outcome body:', err);
+      }
+
+      // Check fallback from watchPage HTML attributes if PingOutcome didn't return direct links
+      let rawHls = null;
+      let rawMp4 = null;
+      const mHls = watchPage.body.match(/data-hls-link=["']([^"']+)["']/);
+      if (mHls) rawHls = mHls[1].replace(/&amp;/g, '&');
+      const mMp4 = watchPage.body.match(/data-mp4-link=["']([^"']+)["']/);
+      if (mMp4) rawMp4 = mMp4[1].replace(/&amp;/g, '&');
+
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ success: true, authResult }));
+      return res.end(JSON.stringify({
+        success: true,
+        streamData: streamData,
+        outcomeBody: outcomeResp.body,
+        rawHls: rawHls,
+        rawMp4: rawMp4
+      }));
     } catch (e) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ success: false, error: e.message, stack: e.stack }));
+      return res.end(JSON.stringify({ error: e.message, stack: e.stack }));
     }
   }
 
@@ -162,24 +258,6 @@ const server = http.createServer(async (req, res) => {
     try {
       const searchUrl = `https://${EINTHUSAN_HOST}/movie/results/?lang=${lang}&query=${encodeURIComponent(query)}`;
       const result = await fetchWithCookies(searchUrl);
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      return res.end(result.body);
-    } catch (e) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: e.message }));
-    }
-  }
-
-  if (parsed.pathname === '/watch-page') {
-    const path = parsed.query.path;
-    try {
-      const auth = await getAuthenticatedSession();
-      const movieUrl = `https://${EINTHUSAN_HOST}${path}`;
-      const result = await fetchWithCookies(movieUrl, {
-        headers: {
-          'Cookie': auth.cookies || auth
-        }
-      });
       res.writeHead(200, { 'Content-Type': 'text/html' });
       return res.end(result.body);
     } catch (e) {
@@ -227,7 +305,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ status: 'einthusan-relay-live', version: '2.0.0' }));
+  res.end(JSON.stringify({ status: 'einthusan-relay-live', version: '2.1.0' }));
 });
 
 server.listen(PORT, () => {
