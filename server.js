@@ -68,68 +68,6 @@ function fetchWithCookies(targetUrl, options = {}) {
   });
 }
 
-async function ensureLogin() {
-  if (sessionCookie && Date.now() < sessionExpires) {
-    return sessionCookie;
-  }
-
-  console.log('[Auth] Logging into Einthusan with account:', ACCOUNT_EMAIL);
-  try {
-    const loginPage = await fetchWithCookies(`https://${EINTHUSAN_HOST}/login/`);
-    const pageIdMatch = loginPage.body.match(/data-pageid=["']([^"']+)["']/i);
-    if (!pageIdMatch) {
-      console.error('[Auth] CSRF data-pageid not found on login page');
-      return '';
-    }
-
-    let cookieJar = loginPage.cookies.map(c => c.split(';')[0]).join('; ');
-
-    const payload = new URLSearchParams({
-      xEvent: 'Login',
-      xJson: JSON.stringify({ Email: ACCOUNT_EMAIL, Password: ACCOUNT_PASS }),
-      tabID: 'vwmSPyo0giMK9nETr0vMMrE/dIBvZQ6a11v+i2kVk6/t7UCLFWORSxePRTDTpRTAeuu/D/9t32a7lO3aJNo7EA==25',
-      'gorilla.csrf.Token': pageIdMatch[1]
-    }).toString();
-
-    const loginRes = await fetchWithCookies(`https://${EINTHUSAN_HOST}/ajax/login/`, {
-      method: 'POST',
-      body: payload,
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        'X-Requested-With': 'XMLHttpRequest',
-        'Origin': `https://${EINTHUSAN_HOST}`,
-        'Referer': `https://${EINTHUSAN_HOST}/login/`,
-        'Cookie': cookieJar
-      }
-    });
-
-    if (loginRes.cookies.length > 0) {
-      cookieJar = [cookieJar, ...loginRes.cookies.map(c => c.split(';')[0])].filter(Boolean).join('; ');
-    }
-
-    let loginData;
-    try {
-      loginData = JSON.parse(loginRes.body);
-    } catch (e) {
-      console.error('[Auth] Failed to parse login response:', loginRes.body);
-      return '';
-    }
-
-    if (loginData.Event === 'redirect' || loginData.Event === 'success') {
-      console.log('[Auth] Login successful! Event:', loginData.Event, 'Data:', loginData.Data);
-      sessionCookie = cookieJar;
-      sessionExpires = Date.now() + (6 * 3600 * 1000); // 6 hours
-      return sessionCookie;
-    } else {
-      console.error('[Auth] Login response indicates failure:', loginData);
-      return '';
-    }
-  } catch (err) {
-    console.error('[Auth] Login error:', err.message);
-    return '';
-  }
-}
-
 const server = http.createServer(async (req, res) => {
   const parsed = url.parse(req.url, true);
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -143,119 +81,46 @@ const server = http.createServer(async (req, res) => {
 
   if (parsed.pathname === '/health' || parsed.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', service: 'einthusan-relay', hasSession: Boolean(sessionCookie) }));
+    return res.end(JSON.stringify({ status: 'ok', service: 'einthusan-relay' }));
   }
 
-  // Auth test endpoint
-  if (parsed.pathname === '/login-test') {
-    const cookie = await ensureLogin();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({
-      success: Boolean(cookie),
-      hasSession: Boolean(sessionCookie)
-    }));
-  }
-
-  // Stream Resolver
-  if (parsed.pathname === '/resolve') {
-    const title = parsed.query.title;
-    const lang = parsed.query.lang || 'tamil';
-    if (!title) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'Missing title' }));
-    }
-
+  if (parsed.pathname === '/debug-login') {
     try {
-      const cookie = await ensureLogin();
-      const searchUrl = `https://${EINTHUSAN_HOST}/movie/results/?lang=${encodeURIComponent(lang)}&query=${encodeURIComponent(title)}`;
-      const searchRes = await fetchWithCookies(searchUrl, {
-        headers: cookie ? { Cookie: cookie } : {}
-      });
-      
-      const watchMatch = searchRes.body.match(/href=["'](\/movie\/watch\/([^"'/]+)\/[^"']*)["']/i);
-      if (!watchMatch) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'Movie not found on Einthusan' }));
-      }
+      const loginPage = await fetchWithCookies(`https://${EINTHUSAN_HOST}/login/`);
+      const pageIdMatch = loginPage.body.match(/data-pageid=["']([^"']+)["']/i);
+      let cookieJar = loginPage.cookies.map(c => c.split(';')[0]).join('; ');
 
-      const watchPath = watchMatch[1];
-      const videoId = watchMatch[2];
-      const watchUrl = `https://${EINTHUSAN_HOST}${watchPath}`;
-      
-      const watchRes = await fetchWithCookies(watchUrl, {
+      const payload = new URLSearchParams({
+        xEvent: 'Login',
+        xJson: JSON.stringify({ Email: ACCOUNT_EMAIL, Password: ACCOUNT_PASS }),
+        tabID: 'vwmSPyo0giMK9nETr0vMMrE/dIBvZQ6a11v+i2kVk6/t7UCLFWORSxePRTDTpRTAeuu/D/9t32a7lO3aJNo7EA==25',
+        'gorilla.csrf.Token': pageIdMatch ? pageIdMatch[1] : ''
+      }).toString();
+
+      const loginRes = await fetchWithCookies(`https://${EINTHUSAN_HOST}/ajax/login/`, {
+        method: 'POST',
+        body: payload,
         headers: {
-          Referer: searchUrl,
-          ...(cookie ? { Cookie: cookie } : {})
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'X-Requested-With': 'XMLHttpRequest',
+          'Origin': `https://${EINTHUSAN_HOST}`,
+          'Referer': `https://${EINTHUSAN_HOST}/login/`,
+          'Cookie': cookieJar
         }
       });
 
-      const hlsMatch = watchRes.body.match(/data-hls-link=["']([^"']+)["']/i);
-      const mp4Match = watchRes.body.match(/data-mp4-link=["']([^"']+)["']/i);
-      const isPremiumMatch = watchRes.body.match(/data-premium=["']([^"']+)["']/i);
-
-      let streamLink = (hlsMatch ? hlsMatch[1] : (mp4Match ? mp4Match[1] : null));
-
-      if (streamLink) {
-        streamLink = streamLink.replace(/&amp;/g, '&');
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({
-          title: title,
-          lang: lang,
-          videoId: videoId,
-          watchUrl: watchUrl,
-          streamUrl: streamLink,
-          isHLS: Boolean(hlsMatch),
-          isPremium: isPremiumMatch ? isPremiumMatch[1] : 'unknown',
-          authenticated: Boolean(cookie)
-        }));
-      }
-
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'Stream link extraction failed' }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({
+        hasPageId: Boolean(pageIdMatch),
+        cookiesSent: cookieJar,
+        ajaxStatus: loginRes.status,
+        ajaxHeaders: loginRes.headers,
+        ajaxBody: loginRes.body
+      }));
     } catch (e) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: e.message }));
     }
-  }
-
-  // Stream proxy with pipe
-  if (parsed.pathname === '/proxy') {
-    const target = parsed.query.url;
-    if (!target) {
-      res.writeHead(400);
-      return res.end('Missing url');
-    }
-
-    try {
-      const targetUrl = new URL(target);
-      const isHttps = targetUrl.protocol === 'https:';
-      const client = isHttps ? https : http;
-
-      const proxyReq = client.request(targetUrl, {
-        method: 'GET',
-        headers: {
-          'User-Agent': HEADERS['User-Agent'],
-          'Referer': `https://${EINTHUSAN_HOST}/`,
-          'Range': req.headers['range'] || 'bytes=0-'
-        },
-        rejectUnauthorized: false
-      }, (proxyRes) => {
-        const headers = { ...proxyRes.headers };
-        headers['access-control-allow-origin'] = '*';
-        res.writeHead(proxyRes.statusCode, headers);
-        proxyRes.pipe(res);
-      });
-
-      proxyReq.on('error', err => {
-        if (!res.headersSent) res.writeHead(502);
-        res.end(err.message);
-      });
-      req.pipe(proxyReq);
-    } catch (e) {
-      res.writeHead(500);
-      res.end(e.message);
-    }
-    return;
   }
 
   res.writeHead(404);
