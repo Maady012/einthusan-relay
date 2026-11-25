@@ -13,7 +13,7 @@ const HEADERS = {
   'Accept-Encoding': 'gzip, deflate'
 };
 
-function fetchUrl(targetUrl, options = {}) {
+function fetchWithCookies(targetUrl, options = {}) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(targetUrl);
     const method = options.method || 'GET';
@@ -34,18 +34,24 @@ function fetchUrl(targetUrl, options = {}) {
       res.on('end', () => {
         let buffer = Buffer.concat(chunks);
         const encoding = res.headers['content-encoding'];
+        const cookies = res.headers['set-cookie'] || [];
+
+        const finish = (decodedStr) => {
+          resolve({ body: decodedStr, headers: res.headers, cookies: cookies, status: res.statusCode });
+        };
+
         if (encoding === 'gzip') {
           zlib.gunzip(buffer, (err, decoded) => {
-            if (err) resolve({ body: buffer.toString('utf-8'), headers: res.headers, status: res.statusCode });
-            else resolve({ body: decoded.toString('utf-8'), headers: res.headers, status: res.statusCode });
+            if (err) finish(buffer.toString('utf-8'));
+            else finish(decoded.toString('utf-8'));
           });
         } else if (encoding === 'deflate') {
           zlib.inflate(buffer, (err, decoded) => {
-            if (err) resolve({ body: buffer.toString('utf-8'), headers: res.headers, status: res.statusCode });
-            else resolve({ body: decoded.toString('utf-8'), headers: res.headers, status: res.statusCode });
+            if (err) finish(buffer.toString('utf-8'));
+            else finish(decoded.toString('utf-8'));
           });
         } else {
-          resolve({ body: buffer.toString('utf-8'), headers: res.headers, status: res.statusCode });
+          finish(buffer.toString('utf-8'));
         }
       });
     });
@@ -63,7 +69,7 @@ function decryptEJ(encryptedData) {
     const decoded = Buffer.from(sliced, 'base64').toString('utf-8');
     return JSON.parse(decoded);
   } catch (e) {
-    return { error: e.message };
+    return null;
   }
 }
 
@@ -83,25 +89,44 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ status: 'ok', service: 'einthusan-relay' }));
   }
 
-  if (parsed.pathname === '/debug') {
-    const title = parsed.query.title || 'Leo';
+  if (parsed.pathname === '/resolve') {
+    const title = parsed.query.title;
     const lang = parsed.query.lang || 'tamil';
+    if (!title) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Missing title' }));
+    }
+
     try {
       const searchUrl = `https://${EINTHUSAN_HOST}/movie/results/?lang=${encodeURIComponent(lang)}&query=${encodeURIComponent(title)}`;
-      const searchRes = await fetchUrl(searchUrl);
+      const searchRes = await fetchWithCookies(searchUrl);
+      
       const watchMatch = searchRes.body.match(/href=["'](\/movie\/watch\/([^"'/]+)\/[^"']*)["']/i);
-      if (!watchMatch) return res.end(JSON.stringify({ error: 'not found' }));
+      if (!watchMatch) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Movie not found on Einthusan' }));
+      }
 
       const watchPath = watchMatch[1];
       const videoId = watchMatch[2];
       const watchUrl = `https://${EINTHUSAN_HOST}${watchPath}`;
-      const watchRes = await fetchUrl(watchUrl, { headers: { Referer: searchUrl } });
+      
+      // Pass cookies from search to watch
+      let cookieHeader = searchRes.cookies.map(c => c.split(';')[0]).join('; ');
+      const watchRes = await fetchWithCookies(watchUrl, {
+        headers: { Referer: searchUrl, Cookie: cookieHeader }
+      });
+
+      // Update cookieHeader with any new cookies from watchRes
+      if (watchRes.cookies.length > 0) {
+        cookieHeader = [cookieHeader, ...watchRes.cookies.map(c => c.split(';')[0])].filter(Boolean).join('; ');
+      }
 
       const pageIdMatch = watchRes.body.match(/data-pageid=["']([^"']+)["']/i);
       const pingablesMatch = watchRes.body.match(/data-ejpingables=["']([^"']+)["']/i);
 
-      let ajaxDebug = null;
-      let decrypted = null;
+      let streamLink = null;
+
       if (pageIdMatch && pingablesMatch) {
         const ajaxUrl = `https://${EINTHUSAN_HOST}/ajax/movie/watch/${videoId}/`;
         const postBody = new URLSearchParams({
@@ -115,41 +140,58 @@ const server = http.createServer(async (req, res) => {
           'gorilla.csrf.Token': pageIdMatch[1]
         }).toString();
 
-        const ajaxRes = await fetchUrl(ajaxUrl, {
+        const ajaxRes = await fetchWithCookies(ajaxUrl, {
           method: 'POST',
           body: postBody,
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
             'X-Requested-With': 'XMLHttpRequest',
-            'Referer': watchUrl
+            'Referer': watchUrl,
+            'Cookie': cookieHeader
           }
         });
-        ajaxDebug = ajaxRes.body;
+
         try {
           const json = JSON.parse(ajaxRes.body);
           if (json && json.Data && json.Data.EJLinks) {
-            decrypted = decryptEJ(json.Data.EJLinks);
+            const dec = decryptEJ(json.Data.EJLinks);
+            if (dec) {
+              streamLink = dec.HLSLink || dec.MP4Link;
+            }
           }
         } catch (e) {
-          decrypted = { jsonError: e.message };
+          console.error('AJAX Parse Error:', ajaxRes.body);
         }
       }
 
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({
-        videoId,
-        hasPageId: Boolean(pageIdMatch),
-        hasPingables: Boolean(pingablesMatch),
-        ajaxRaw: ajaxDebug,
-        decrypted: decrypted
-      }));
+      // Fallback to data attributes if AJAX fails
+      if (!streamLink) {
+        const hlsMatch = watchRes.body.match(/data-hls-link=["']([^"']+)["']/i);
+        const mp4Match = watchRes.body.match(/data-mp4-link=["']([^"']+)["']/i);
+        if (hlsMatch) streamLink = hlsMatch[1].replace(/&amp;/g, '&');
+        else if (mp4Match) streamLink = mp4Match[1].replace(/&amp;/g, '&');
+      }
+
+      if (streamLink) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          title: title,
+          lang: lang,
+          watchUrl: watchUrl,
+          streamUrl: streamLink,
+          isHLS: streamLink.includes('.m3u8')
+        }));
+      }
+
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Stream link extraction failed' }));
     } catch (e) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: e.message }));
     }
   }
 
-  // Stream proxy with pipe
+  // Stream proxy
   if (parsed.pathname === '/proxy') {
     const target = parsed.query.url;
     if (!target) {
@@ -194,5 +236,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Relay debug running on port ${PORT}`);
+  console.log(`Relay active on port ${PORT}`);
 });
