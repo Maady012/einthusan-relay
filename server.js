@@ -69,6 +69,19 @@ const server = http.createServer(async (req, res) => {
   const parsed = url.parse(req.url, true);
   res.setHeader('Access-Control-Allow-Origin', '*');
 
+  
+  if (parsed.pathname === "/inspect-js") {
+    try {
+      const jsUrl = parsed.query.url || "https://einthusan.tv/jscache/2rn3qOrjCCkj1ZnUedXKnw/einthusan-PGLogin.js";
+      const jsData = await fetchWithCookies(jsUrl);
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      return res.end(jsData.body);
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: e.message }));
+    }
+  }
+
   if (parsed.pathname === '/inspect-login-html') {
     try {
       const loginPage = await fetchWithCookies(`https://${EINTHUSAN_HOST}/login/`);
