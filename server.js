@@ -111,13 +111,11 @@ const server = http.createServer(async (req, res) => {
       const videoId = watchMatch[2];
       const watchUrl = `https://${EINTHUSAN_HOST}${watchPath}`;
       
-      // Pass cookies from search to watch
       let cookieHeader = searchRes.cookies.map(c => c.split(';')[0]).join('; ');
       const watchRes = await fetchWithCookies(watchUrl, {
         headers: { Referer: searchUrl, Cookie: cookieHeader }
       });
 
-      // Update cookieHeader with any new cookies from watchRes
       if (watchRes.cookies.length > 0) {
         cookieHeader = [cookieHeader, ...watchRes.cookies.map(c => c.split(';')[0])].filter(Boolean).join('; ');
       }
@@ -125,7 +123,7 @@ const server = http.createServer(async (req, res) => {
       const pageIdMatch = watchRes.body.match(/data-pageid=["']([^"']+)["']/i);
       const pingablesMatch = watchRes.body.match(/data-ejpingables=["']([^"']+)["']/i);
 
-      let streamLink = null;
+      let rawEJ = null;
 
       if (pageIdMatch && pingablesMatch) {
         const ajaxUrl = `https://${EINTHUSAN_HOST}/ajax/movie/watch/${videoId}/`;
@@ -154,81 +152,28 @@ const server = http.createServer(async (req, res) => {
         try {
           const json = JSON.parse(ajaxRes.body);
           if (json && json.Data && json.Data.EJLinks) {
-            const dec = decryptEJ(json.Data.EJLinks);
-            if (dec) {
-              streamLink = dec.HLSLink || dec.MP4Link;
-            }
+            rawEJ = decryptEJ(json.Data.EJLinks);
           }
-        } catch (e) {
-          console.error('AJAX Parse Error:', ajaxRes.body);
-        }
+        } catch (e) {}
       }
 
-      // Fallback to data attributes if AJAX fails
-      if (!streamLink) {
-        const hlsMatch = watchRes.body.match(/data-hls-link=["']([^"']+)["']/i);
-        const mp4Match = watchRes.body.match(/data-mp4-link=["']([^"']+)["']/i);
-        if (hlsMatch) streamLink = hlsMatch[1].replace(/&amp;/g, '&');
-        else if (mp4Match) streamLink = mp4Match[1].replace(/&amp;/g, '&');
-      }
+      const hlsMatch = watchRes.body.match(/data-hls-link=["']([^"']+)["']/i);
+      const mp4Match = watchRes.body.match(/data-mp4-link=["']([^"']+)["']/i);
 
-      if (streamLink) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({
-          title: title,
-          lang: lang,
-          watchUrl: watchUrl,
-          streamUrl: streamLink,
-          isHLS: streamLink.includes('.m3u8')
-        }));
-      }
-
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'Stream link extraction failed' }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({
+        title: title,
+        lang: lang,
+        videoId: videoId,
+        watchUrl: watchUrl,
+        rawEJ: rawEJ,
+        dataHLS: hlsMatch ? hlsMatch[1] : null,
+        dataMP4: mp4Match ? mp4Match[1] : null
+      }));
     } catch (e) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: e.message }));
     }
-  }
-
-  // Stream proxy
-  if (parsed.pathname === '/proxy') {
-    const target = parsed.query.url;
-    if (!target) {
-      res.writeHead(400);
-      return res.end('Missing url');
-    }
-
-    try {
-      const targetUrl = new URL(target);
-      const isHttps = targetUrl.protocol === 'https:';
-      const client = isHttps ? https : http;
-
-      const proxyReq = client.request(targetUrl, {
-        method: 'GET',
-        headers: {
-          'User-Agent': HEADERS['User-Agent'],
-          'Referer': `https://${EINTHUSAN_HOST}/`,
-          'Range': req.headers['range'] || 'bytes=0-'
-        },
-        rejectUnauthorized: false
-      }, (proxyRes) => {
-        const headers = { ...proxyRes.headers };
-        headers['access-control-allow-origin'] = '*';
-        res.writeHead(proxyRes.statusCode, headers);
-        proxyRes.pipe(res);
-      });
-
-      proxyReq.on('error', err => {
-        if (!res.headersSent) res.writeHead(502);
-        res.end(err.message);
-      });
-      req.pipe(proxyReq);
-    } catch (e) {
-      res.writeHead(500);
-      res.end(e.message);
-    }
-    return;
   }
 
   res.writeHead(404);
