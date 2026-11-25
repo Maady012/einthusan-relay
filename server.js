@@ -4,8 +4,6 @@ const url = require('url');
 const zlib = require('zlib');
 
 const PORT = process.env.PORT || 8080;
-
-// Upstream Einthusan Base
 const EINTHUSAN_HOST = 'einthusan.tv';
 
 const HEADERS = {
@@ -59,13 +57,11 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  // Endpoint 1: Health
   if (parsed.pathname === '/health' || parsed.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ status: 'ok', service: 'einthusan-relay' }));
   }
 
-  // Endpoint 2: Resolve stream for title & lang
   if (parsed.pathname === '/resolve') {
     const title = parsed.query.title;
     const lang = parsed.query.lang || 'tamil';
@@ -94,12 +90,17 @@ const server = http.createServer(async (req, res) => {
 
       if (rawStream) {
         rawStream = rawStream.replace(/&amp;/g, '&');
+        // Check if CDN host is an IP, rewrite to cdn1.einthusan.io for SSL handshake
+        const streamObj = new URL(rawStream);
+        const fixedUrl = `https://cdn1.einthusan.io${streamObj.pathname}${streamObj.search}`;
+
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
           title: title,
           lang: lang,
           watchUrl: watchUrl,
           streamUrl: rawStream,
+          cdnDomainUrl: fixedUrl,
           isHLS: Boolean(hlsMatch)
         }));
       } else {
@@ -112,7 +113,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // Endpoint 3: Video Stream Proxy
+  // Streaming Proxy endpoint
   if (parsed.pathname === '/proxy') {
     const target = parsed.query.url;
     if (!target) {
@@ -125,23 +126,37 @@ const server = http.createServer(async (req, res) => {
       const isHttps = targetUrl.protocol === 'https:';
       const client = isHttps ? https : http;
 
-      const proxyReq = client.request(targetUrl, {
+      // Extract path and query
+      const options = {
+        hostname: targetUrl.hostname,
+        port: targetUrl.port || (isHttps ? 443 : 80),
+        path: targetUrl.pathname + targetUrl.search,
         method: 'GET',
         headers: {
           'User-Agent': HEADERS['User-Agent'],
           'Referer': `https://${EINTHUSAN_HOST}/`,
           'Range': req.headers['range'] || 'bytes=0-'
         },
-        rejectUnauthorized: false
-      }, (proxyRes) => {
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        rejectUnauthorized: false,
+        checkServerIdentity: () => undefined // Disable hostname mismatch errors on raw CDN IPs
+      };
+
+      const proxyReq = client.request(options, (proxyRes) => {
+        // Forward status and headers
+        const headers = { ...proxyRes.headers };
+        headers['access-control-allow-origin'] = '*';
+        res.writeHead(proxyRes.statusCode, headers);
         proxyRes.pipe(res);
       });
 
       proxyReq.on('error', err => {
-        if (!res.headersSent) res.writeHead(502);
-        res.end(err.message);
+        console.error('Proxy Error:', err.message);
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'text/plain' });
+        }
+        res.end(`Proxy stream failed: ${err.message}`);
       });
+
       req.pipe(proxyReq);
     } catch (e) {
       res.writeHead(500);
