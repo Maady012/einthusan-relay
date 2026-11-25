@@ -9,9 +9,6 @@ const EINTHUSAN_HOST = 'einthusan.tv';
 const ACCOUNT_EMAIL = process.env.EINTHUSAN_EMAIL || 'trickzfru@gmail.com';
 const ACCOUNT_PASS = process.env.EINTHUSAN_PASSWORD || 'Maddy0124';
 
-let sessionCookie = '';
-let sessionExpires = 0;
-
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -71,51 +68,25 @@ function fetchWithCookies(targetUrl, options = {}) {
 const server = http.createServer(async (req, res) => {
   const parsed = url.parse(req.url, true);
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(200);
-    return res.end();
-  }
-
-  if (parsed.pathname === '/health' || parsed.pathname === '/') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', service: 'einthusan-relay' }));
-  }
-
-  if (parsed.pathname === '/debug-login') {
+  if (parsed.pathname === '/inspect-login-html') {
     try {
       const loginPage = await fetchWithCookies(`https://${EINTHUSAN_HOST}/login/`);
-      const pageIdMatch = loginPage.body.match(/data-pageid=["']([^"']+)["']/i);
-      let cookieJar = loginPage.cookies.map(c => c.split(';')[0]).join('; ');
-
-      const payload = new URLSearchParams({
-        xEvent: 'Login',
-        xJson: JSON.stringify({ Email: ACCOUNT_EMAIL, Password: ACCOUNT_PASS }),
-        tabID: 'vwmSPyo0giMK9nETr0vMMrE/dIBvZQ6a11v+i2kVk6/t7UCLFWORSxePRTDTpRTAeuu/D/9t32a7lO3aJNo7EA==25',
-        'gorilla.csrf.Token': pageIdMatch ? pageIdMatch[1] : ''
-      }).toString();
-
-      const loginRes = await fetchWithCookies(`https://${EINTHUSAN_HOST}/ajax/login/`, {
-        method: 'POST',
-        body: payload,
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-          'X-Requested-With': 'XMLHttpRequest',
-          'Origin': `https://${EINTHUSAN_HOST}`,
-          'Referer': `https://${EINTHUSAN_HOST}/login/`,
-          'Cookie': cookieJar
-        }
-      });
+      const inputs = loginPage.body.match(/<input[^>]+>/gi) || [];
+      const forms = loginPage.body.match(/<form[^>]+>/gi) || [];
+      const scripts = loginPage.body.match(/<script[^>]*src=["']([^"']+)["'][^>]*>/gi) || [];
+      
+      // Also look for gorilla or csrf in html
+      const csrfMatches = loginPage.body.match(/.{0,50}csrf.{0,50}/gi) || [];
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({
-        hasPageId: Boolean(pageIdMatch),
-        cookiesSent: cookieJar,
-        ajaxStatus: loginRes.status,
-        ajaxHeaders: loginRes.headers,
-        ajaxBody: loginRes.body
+        status: loginPage.status,
+        cookies: loginPage.cookies,
+        inputs: inputs,
+        forms: forms,
+        scripts: scripts,
+        csrfMatches: csrfMatches
       }));
     } catch (e) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -123,10 +94,10 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  res.writeHead(404);
-  res.end('Not Found');
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ status: 'ok' }));
 });
 
 server.listen(PORT, () => {
-  console.log(`Relay active on port ${PORT}`);
+  console.log(`Inspection relay active on port ${PORT}`);
 });
