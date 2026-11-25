@@ -1,0 +1,9 @@
+{
+  "name": "einthusan-relay",
+  "version": "1.0.0",
+  "description": "Zero-cost Einthusan Relay for Nuvio & Cloudstream",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
